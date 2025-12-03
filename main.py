@@ -2468,7 +2468,7 @@ Provide a helpful, direct answer.
             return jsonify({"error": "Failed to serialize query results for analysis."}), 500
             
         if len(query_results_json) > 100000:
-             query_results_json = df.head(100).to_json(orient="records")
+             query_results_json = df.head(1000).to_json(orient="records")
              print("Warning: Query result too large, truncating for AI analysis.")
 
         prompt_step4 = f"""
