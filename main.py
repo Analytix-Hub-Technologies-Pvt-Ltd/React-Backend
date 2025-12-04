@@ -364,21 +364,34 @@ def call_gemini_api(prompt_text, is_json_output=False):
         }
 
     try:
-        response = requests.post(GEMINI_API_URL, headers=headers, data=json.dumps(payload))
+        # 1. Make the Request
+        response = requests.post(GEMINI_API_URL, headers=headers, data=json.dumps(payload), timeout=240)
         response.raise_for_status()
-        result = response.json()
         
+        # 2. Parse the Success Response (This was missing/unreachable in your previous code)
+        result = response.json()
         text_content = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        
+        # 3. Return the text
         return text_content
+
+    except requests.exceptions.Timeout:
+        print("Error: Gemini API timed out.")
+        return "Error: The AI model took too long to respond. Please try with a smaller dataset."
+        
     except requests.exceptions.RequestException as e:
         print(f"Error calling Gemini API: {e}")
         if e.response:
             print(f"Gemini API Response: {e.response.text}")
         return f"Error: Could not connect to Gemini API. {e}"
+        
     except (KeyError, IndexError, json.JSONDecodeError) as e:
         print(f"Error parsing Gemini response: {e}")
-        print(f"Raw Gemini Response: {result}")
         return "Error: Received an invalid response from the AI model."
+        
+    except Exception as e:
+        print(f"Unexpected Error in call_gemini_api: {e}")
+        return f"Error: An unexpected error occurred. {str(e)}"
 
 def call_gemini_vision_api(image_bytes, mime_type, prompt_text):
     if not GEMINI_API_KEY:
@@ -1264,7 +1277,15 @@ def get_chat_history():
                 # --- SQL INJECTION FIX: Use parameterized query ---
                 # --- LOGIC CHANGED from main1.py: main.py gets all, main1.py limits to 10. Sticking with main.py's logic.
                 cur.execute(
-                    f'SELECT sender, text FROM {SNOWFLAKE_SCHEMA}.messages WHERE session_id = %s ORDER BY created_at ASC LIMIT 5',
+                    f"""
+                    SELECT sender, text FROM (
+                        SELECT sender, text, created_at 
+                        FROM {SNOWFLAKE_SCHEMA}.messages 
+                        WHERE session_id = %s 
+                        ORDER BY created_at DESC 
+                        LIMIT 5
+                    ) ORDER BY created_at ASC
+                    """,
                     (session_id,),
                 )
                 messages = [{"sender": r["SENDER"], "text": r["TEXT"]} for r in cur.fetchall()]
@@ -2322,6 +2343,7 @@ You are an expert {db_type} data analyst. Your sole task is to convert the user'
 - You are connected to a database with this schema:
 {schema_context}
 - If the question can be answered with SQL, return ONLY the SQL query.
+- **IMPORTANT: ALWAYS add 'LIMIT 500' (or equivalent) to your query to prevent performance issues, unless the user explicitly asks for 'all' records.**
 - If the question is a greeting, a general question (e.g., "what is SQL?"), or cannot be answered with the provided schema, return ONLY the text "NO_SQL".
 - Do not add any explanation, markdown, or any text other than the query or "NO_SQL".
 
@@ -2468,7 +2490,7 @@ Provide a helpful, direct answer.
             return jsonify({"error": "Failed to serialize query results for analysis."}), 500
             
         if len(query_results_json) > 100000:
-             query_results_json = df.head(1000).to_json(orient="records")
+             query_results_json = df.head(100).to_json(orient="records")
              print("Warning: Query result too large, truncating for AI analysis.")
 
         prompt_step4 = f"""
@@ -2515,10 +2537,14 @@ Example Response:
             chat_reply = analysis_json.get("chat_reply", "I found data but couldn't generate a chat reply.")
             chat_reply += f"\n\n**Generated Query:**\n```sql\n{sql_query}\n```"
             
-            # --- ADDING Table Data for ChatWithTable ---
             table_data = None
-            if df.shape[0] < 200: # Only send small-ish dataframes to the table component
-                table_data = json.loads(query_results_json) # Use the same JSON as the AI
+            
+            if df.shape[0] < 1000: 
+                table_data = df.to_dict(orient="records")
+            else:
+                table_data = df.head(100).to_dict(orient="records")
+
+            table_columns = [{"field": col, "headerName": col, "width": 150} for col in df.columns]
 
             return jsonify({
                 "reply": chat_reply,
@@ -2528,22 +2554,31 @@ Example Response:
                     "chart_specs": analysis_json.get("chart_specs")
                 },
                 "raw_data": query_results_json,
-                "table_data": table_data # NEW
+                "table_data": table_data,
+                "table_columns": table_columns
             })
 
         except json.JSONDecodeError as e:
             print(f"Failed to decode analysis JSON from Gemini: {e}")
-            print(f"Received string: {analysis_response_str}")
-            # --- Also add table_data to fallback ---
+            
+            # Fallback data preparation
             table_data = None
-            if df.shape[0] < 200:
-                table_data = json.loads(query_results_json)
+            table_columns = []
+            
+            if df is not None and not df.empty:
+                table_columns = [{"field": col, "headerName": col, "width": 150} for col in df.columns]
                 
+                if df.shape[0] < 200:
+                    table_data = df.head(200).to_dict(orient="records") # Use head(200) or similar logic
+                else:
+                     table_data = df.head(200).to_dict(orient="records")
+
             return jsonify({
                 "reply": "I found the following data:\n\n" + df.head(10).to_string() + f"\n\n**Generated Query:**\n```sql\n{sql_query}\n```",
                 "dashboard_data": None,
                 "raw_data": query_results_json,
-                "table_data": table_data # NEW
+                "table_data": table_data,
+                "table_columns": table_columns # <--- NEW FIELD
             })
         except Exception as e:
             print(f"Error in final analysis step: {e}")
@@ -3033,5 +3068,4 @@ def get_report(filename):
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=8000)
-
+    app.run(debug=True)
