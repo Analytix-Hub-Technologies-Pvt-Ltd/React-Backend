@@ -2291,7 +2291,6 @@ Example Response:
         print(f"Error in /api/chat/generate_from_metadata: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
-# --- UPDATED: intelligent_query (to accept catalogid) ---
 @app.route("/api/chat/intelligent_query", methods=["POST"])
 def intelligent_query():
     data = request.get_json()
@@ -2355,11 +2354,15 @@ User Question: "{prompt}"
         if sql_query.startswith("Error:"):
             return jsonify({"error": sql_query}), 500
         
-        # Clean SQL query
-        if sql_query.upper().startswith("```SQL"):
-            sql_query = sql_query[6:-3].strip()
-        elif sql_query.upper().startswith("```"):
-            sql_query = sql_query[3:-3].strip()
+        # --- UPDATED CLEANUP LOGIC START ---
+        # 1. Extract from Markdown code blocks if present
+        code_block_match = re.search(r"```(?:sql|snowflake)?\s*(.*?)```", sql_query, re.DOTALL | re.IGNORECASE)
+        if code_block_match:
+            sql_query = code_block_match.group(1).strip()
+
+        # 2. Remove specific leading language labels if they appear without backticks (e.g. "snowflake\nSELECT")
+        sql_query = re.sub(r"^\s*(?:snowflake|sql)\s+", "", sql_query, flags=re.IGNORECASE).strip()
+        # --- UPDATED CLEANUP LOGIC END ---
 
         # --- Handle NO_SQL (General Question) ---
         if sql_query.upper() == "NO_SQL":
@@ -3069,3 +3072,4 @@ def get_report(filename):
 
 if __name__ == '__main__':
     app.run(debug=True)
+
