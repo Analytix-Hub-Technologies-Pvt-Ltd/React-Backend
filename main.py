@@ -6,6 +6,8 @@ import snowflake.connector
 import oracledb
 from flask_cors import CORS
 from sqlalchemy import create_engine
+from sqlalchemy.pool import QueuePool
+from contextlib import contextmanager  # <-- ADDED IMPORT
 import pandas as pd
 import os
 import docx2txt
@@ -30,6 +32,8 @@ from ydata_profiling import ProfileReport
 import uuid
 from cryptography.fernet import Fernet
 from werkzeug.middleware.proxy_fix import ProxyFix
+import google.generativeai as genai
+from google.api_core import exceptions as google_exceptions
 
 encryption_key_str = os.environ.get('ENCRYPTION_KEY')
 if not encryption_key_str:
@@ -61,10 +65,14 @@ CORS(app, supports_credentials=True, origins=["http://localhost:3000", "https://
 REPORTS_DIR = "reports"
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
+# --- NEW: Configure Gemini SDK ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") 
 if not GEMINI_API_KEY:
     print("Warning: GEMINI_API_KEY environment variable not set.")
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+else:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+DEFAULT_MODEL_NAME = "gemini-2.5-flash"
 
 SNOWFLAKE_SCHEMA = os.getenv("SNOWFLAKE_SCHEMA", "ANALYTICSBOT")
 SNOWFLAKE_WAREHOUSE = os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH")
@@ -74,11 +82,11 @@ SNOWFLAKE_ACCOUNT = os.getenv("SNOWFLAKE_ACCOUNT")
 SNOWFLAKE_DATABASE = os.getenv("SNOWFLAKE_DATABASE", "LANDING")
 
 # --- DATABASE CONNECTION REFACTOR ---
-# Removed global 'conn'. We will create connections on-demand.
 
 def get_db_conn():
     """
-    Creates and returns a new Snowflake connection for the app's backend.
+    Creates and returns a new Snowflake connection for initial setup (DB creation).
+    This is NOT pooled because it might run before the DB/Schema exists.
     """
     try:
         if not all([SNOWFLAKE_USER, SNOWFLAKE_PASSWORD, SNOWFLAKE_ACCOUNT]):
@@ -88,10 +96,6 @@ def get_db_conn():
             user=SNOWFLAKE_USER,
             password=SNOWFLAKE_PASSWORD,
             account=SNOWFLAKE_ACCOUNT,
-            # --- UPDATED: Connect without specifying DB/Schema initially for init ---
-            # warehouse=SNOWFLAKE_WAREHOUSE,
-            # database=SNOWFLAKE_DATABASE,
-            # schema=SNOWFLAKE_SCHEMA
         )
         return conn
     except Exception as e:
@@ -250,10 +254,10 @@ def init_db_snowflake():
                     CREATE TABLE IF NOT EXISTS {SNOWFLAKE_SCHEMA}.semantic_catalogs_detail (
                         id INTEGER AUTOINCREMENT START 1 INCREMENT 1,
                         catalog_id INTEGER,
-                        schema_name VARCHAR(200), -- Added schema_name from main1.py logic
+                        schema_name VARCHAR(200),
                         table_name VARCHAR(200) NOT NULL,
                         column_name VARCHAR(200) NOT NULL,
-                        data_type VARCHAR(200), -- Added data_type from main1.py logic
+                        data_type VARCHAR(200),
                         description STRING,
                         created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP,
@@ -288,16 +292,12 @@ def init_db_snowflake():
 
 init_db_snowflake()
 
-def get_db_conn_configured():
-    """
-    Creates and returns a Snowflake connection already configured
-    with the app's DB and Schema.
-    """
+# --- DB POOLING IMPLEMENTATION ---
+
+def _create_raw_snowflake_connection():
+    """Creator function for SQLAlchemy QueuePool"""
     try:
-        if not all([SNOWFLAKE_USER, SNOWFLAKE_PASSWORD, SNOWFLAKE_ACCOUNT]):
-            raise ValueError("Missing Snowflake environment variables (USER, PASSWORD, ACCOUNT) for app backend")
-            
-        conn = snowflake.connector.connect(
+        return snowflake.connector.connect(
             user=SNOWFLAKE_USER,
             password=SNOWFLAKE_PASSWORD,
             account=SNOWFLAKE_ACCOUNT,
@@ -305,16 +305,45 @@ def get_db_conn_configured():
             database=SNOWFLAKE_DATABASE,
             schema=SNOWFLAKE_SCHEMA
         )
-        return conn
     except Exception as e:
-        print(f"FATAL: Could not connect to Snowflake for app backend: {e}")
-        return None
+        print(f"FATAL: Could not create Snowflake connection for pool: {e}")
+        raise
+
+# Create the Connection Pool
+# pool_size=10: Maintain 10 connections.
+# max_overflow=10: Allow 10 more if pool is full (total 20).
+# recycle=3600: Recycle connections every hour to prevent timeouts.
+SNOWFLAKE_POOL = QueuePool(
+    _create_raw_snowflake_connection,
+    max_overflow=10,
+    pool_size=10,
+    recycle=3600
+)
+
+# --- FIX: Context Manager for Pooling ---
+@contextmanager
+def get_db_conn_configured():
+    """
+    Yields a pooled Snowflake connection configured with the app's DB and Schema.
+    Context manager ensures it returns to the pool automatically.
+    """
+    conn = None
+    try:
+        # SNOWFLAKE_POOL.connect() returns a _ConnectionFairy proxy
+        conn = SNOWFLAKE_POOL.connect()
+        yield conn
+    except Exception as e:
+        print(f"FATAL: Error getting/using connection from pool: {e}")
+        raise e
+    finally:
+        # Closing the proxy returns the underlying connection to the pool
+        if conn:
+            conn.close()
 
 def get_or_create_session_id(user_id):
     with get_db_conn_configured() as conn:
-        if not conn:
-            raise Exception("Database connection is not available")
-        
+        # Note: conn is a wrapper, so we access cursor via conn.cursor()
+        # snowflake.connector cursor supports context manager
         with conn.cursor() as cur:
             cur.execute(f"SELECT id FROM {SNOWFLAKE_SCHEMA}.chat_sessions WHERE user_id = %s", (user_id,))
             row = cur.fetchone()
@@ -332,62 +361,33 @@ def call_gemini_api(prompt_text, is_json_output=False):
     if not GEMINI_API_KEY:
         return "Error: GEMINI_API_KEY is not set on the server."
 
-    headers = {'Content-Type': 'application/json'}
-    payload = {
-        "contents": [{
-            "parts": [{"text": prompt_text}]
-        }]
-    }
-
-    if is_json_output:
-        payload["generationConfig"] = {
-            "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "tablename": {"type": "STRING"},
-                    "columns": {
-                        "type": "ARRAY",
-                        "items": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "id": {"type": "NUMBER"},
-                                "column": {"type": "STRING"},
-                                "column_description": {"type": "STRING"}
-                            },
-                            "required": ["id", "column", "column_description"]
-                        }
-                    }
-                },
-                "required": ["tablename", "columns"]
-            }
-        }
-
     try:
-        # 1. Make the Request
-        response = requests.post(GEMINI_API_URL, headers=headers, data=json.dumps(payload), timeout=240)
-        response.raise_for_status()
+        generation_config = {}
         
-        # 2. Parse the Success Response (This was missing/unreachable in your previous code)
-        result = response.json()
-        text_content = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-        
-        # 3. Return the text
-        return text_content
+        if is_json_output:
+            generation_config["response_mime_type"] = "application/json"
 
-    except requests.exceptions.Timeout:
+        model = genai.GenerativeModel(DEFAULT_MODEL_NAME)
+        
+        # Make the request
+        response = model.generate_content(
+            prompt_text, 
+            generation_config=generation_config
+        )
+        
+        return response.text
+
+    except google_exceptions.DeadlineExceeded:
         print("Error: Gemini API timed out.")
         return "Error: The AI model took too long to respond. Please try with a smaller dataset."
         
-    except requests.exceptions.RequestException as e:
+    except google_exceptions.GoogleAPIError as e:
         print(f"Error calling Gemini API: {e}")
-        if e.response:
-            print(f"Gemini API Response: {e.response.text}")
         return f"Error: Could not connect to Gemini API. {e}"
         
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
-        print(f"Error parsing Gemini response: {e}")
-        return "Error: Received an invalid response from the AI model."
+    except ValueError as e:
+        print(f"Error parsing Gemini response (blocked or empty): {e}")
+        return "Error: The AI model blocked the response or returned nothing."
         
     except Exception as e:
         print(f"Unexpected Error in call_gemini_api: {e}")
@@ -397,47 +397,37 @@ def call_gemini_vision_api(image_bytes, mime_type, prompt_text):
     if not GEMINI_API_KEY:
         return "Error: GEMINI_API_KEY is not set on the server."
         
-    headers = {'Content-Type': 'application/json'}
-    encoded_image = base64.b64encode(image_bytes).decode('utf-8')
-    
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt_text},
-                    {
-                        "inlineData": {
-                            "mimeType": mime_type,
-                            "data": encoded_image
-                        }
-                    }
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.2,
-            "topK": 32,
-            "topP": 1,
-            "maxOutputTokens": 4096,
-        }
-    }
-
     try:
-        response = requests.post(GEMINI_API_URL, headers=headers, data=json.dumps(payload))
-        response.raise_for_status()
-        result = response.json()
+        model = genai.GenerativeModel(DEFAULT_MODEL_NAME)
+
+        content = [
+            prompt_text,
+            {
+                "mime_type": mime_type,
+                "data": image_bytes
+            }
+        ]
+
+        generation_config = {
+            "temperature": 0.2,
+            "top_k": 32,
+            "top_p": 1,
+            "max_output_tokens": 4096,
+        }
+
+        response = model.generate_content(
+            content,
+            generation_config=generation_config
+        )
         
-        text_content = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-        return text_content
-    except requests.exceptions.RequestException as e:
+        return response.text
+
+    except google_exceptions.GoogleAPIError as e:
         print(f"Error calling Gemini Vision API: {e}")
-        if e.response:
-            print(f"Gemini API Response: {e.response.text}")
         return f"Error: Could not connect to Gemini API. {e}"
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
-        print(f"Error parsing Gemini response: {e}")
-        print(f"Raw Gemini Response: {result}")
-        return "Error: Received an invalid response from the AI model."
+    except Exception as e:
+        print(f"Unexpected Error in call_gemini_vision_api: {e}")
+        return f"Error: An unexpected error occurred. {str(e)}"
 
 @app.route('/connect_database', methods=['POST'])
 def connect_database():
@@ -1575,6 +1565,43 @@ def update_password():
         print(f"Error updating password: {e}")
         return jsonify({"success": False, "error": "Database error"}), 500
 
+@app.route('/api/users/update_catalogs', methods=['POST'])
+def update_user_catalogs():
+    data = request.json
+    username = data.get('username')
+    assigned_catalogs = data.get('assigned_catalogs', [])
+
+    if not username:
+        return jsonify({"success": False, "error": "Missing username"}), 400
+
+    try:
+        with get_db_conn_configured() as conn:
+            with conn.cursor() as cur:
+                # 1. Get User ID
+                cur.execute(f"SELECT id FROM {SNOWFLAKE_SCHEMA}.users WHERE username = %s", (username,))
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"success": False, "error": "User not found"}), 404
+                user_id = row[0]
+
+                # 2. Delete existing mappings for this user
+                cur.execute(f"DELETE FROM {SNOWFLAKE_SCHEMA}.user_catalogs WHERE user_id = %s", (user_id,))
+
+                # 3. Insert new mappings
+                if assigned_catalogs:
+                    # Snowflake supports multi-row insert, but a loop is safe and clear for this scale
+                    for cat_id in assigned_catalogs:
+                         cur.execute(
+                             f"INSERT INTO {SNOWFLAKE_SCHEMA}.user_catalogs (user_id, catalog_id) VALUES (%s, %s)", 
+                             (user_id, cat_id)
+                         )
+                
+                conn.commit()
+        return jsonify({"success": True, "message": "User catalogs updated successfully"}), 200
+    except Exception as e:
+        print(f"Error updating user catalogs: {e}")
+        return jsonify({"success": False, "error": "Database error"}), 500
+
 @app.route('/get_columns', methods=['POST'])
 def get_columns():
     data = request.json
@@ -2336,13 +2363,25 @@ def intelligent_query():
         if schema_context.startswith("Error"):
              return jsonify({"error": schema_context}), 500
         
-        # --- Step 2: Generate SQL ---
+        # --- Step 2: Generate SQL (UPDATED: NO SELECT *, LOWER() & INDIAN TERMS) ---
         prompt_step2 = f"""
 You are an expert {db_type} data analyst. Your sole task is to convert the user's question into a single, runnable {db_type} SQL query.
 - You are connected to a database with this schema:
 {schema_context}
 - If the question can be answered with SQL, return ONLY the SQL query.
 - **IMPORTANT: ALWAYS add 'LIMIT 500' (or equivalent) to your query to prevent performance issues, unless the user explicitly asks for 'all' records.**
+- **Handle Indian Numbering System:** If the user mentions terms like 'Lakh', 'Lakhs', 'L', 'Crore', 'Crores', 'Cr', convert them to standard integers (1 Lakh = 100,000; 1 Crore = 10,000,000). 
+    - Example: "Revenue > 5 Cr" -> "Revenue > 50000000"
+    - Example: "Price under 2 Lakhs" -> "Price < 200000"
+- **String Matching Strategy (CRITICAL):** - **ALWAYS make text filters case-insensitive** using `LOWER()`.
+    - **Use Wildcards:** For categorical text (Category, State, Status), use `LIKE` with wildcards `%` to match partial strings.
+    - **Syntax:** `LOWER(column_name) LIKE '%value%'` (ensure the value inside quotes is lowercase).
+    - Example: User asks for "Roads" -> `LOWER(CATEGORY) LIKE '%roads%'`.
+    - Example: User asks for "Uttar Pradesh" -> `LOWER(STATENAME) LIKE '%uttar pradesh%'`.
+    - Example: User asks for "Railways, Roads" -> `(LOWER(CATEGORY) LIKE '%railways%' OR LOWER(CATEGORY) LIKE '%roads%')`.
+- **Column Selection (CRITICAL):** - **Do NOT use `SELECT *`.** Fetching all columns (especially wide text columns) slows down performance.
+    - **Select ONLY the specific columns** necessary to answer the user's question.
+    - If the user asks for "details", "all info", or implies a full row fetch, select the **top 10-15 most relevant columns** (e.g., IDs, Names, Dates, Monetary Values, Statuses) instead of `*`.
 - If the question is a greeting, a general question (e.g., "what is SQL?"), or cannot be answered with the provided schema, return ONLY the text "NO_SQL".
 - Do not add any explanation, markdown, or any text other than the query or "NO_SQL".
 
@@ -2383,14 +2422,11 @@ Provide a helpful, direct answer.
         df = None
         conn_db = None
         try:
-            # --- *** NEW SECURITY FIX *** ---
-            # Deny-list destructive keywords. This is a crucial safeguard
-            # when executing AI-generated code.
+            # --- *** SECURITY FIX *** ---
             destructive_keywords = [
                 'DROP', 'DELETE', 'INSERT', 'UPDATE', 
                 'TRUNCATE', 'ALTER', 'CREATE', 'GRANT', 'REVOKE'
             ]
-            # Check for keywords as whole words
             sql_upper_tokens = set(re.findall(r"[\w']+", sql_query.upper()))
             
             for keyword in destructive_keywords:
@@ -2401,7 +2437,7 @@ Provide a helpful, direct answer.
                         "dashboard_data": None,
                         "raw_data": None
                     })
-            # --- *** END NEW SECURITY FIX *** ---
+            # --- *** END SECURITY FIX *** ---
 
             db_type = connection_info.get('db_type')
             host = connection_info.get('host')
@@ -2410,7 +2446,7 @@ Provide a helpful, direct answer.
             password = connection_info.get('password')
             dbname = connection_info.get('dbname')
             
-            # --- NEW: Decrypt password if from catalog ---
+            # --- Decrypt password if from catalog ---
             if catalogid:
                 try:
                     with get_db_conn_configured() as conn:
@@ -2419,7 +2455,6 @@ Provide a helpful, direct answer.
                             result = cur.fetchone()
                             if result and result[0]:
                                 password = cipher.decrypt(result[0].encode()).decode()
-                                print("Decrypted password from catalog for query execution.")
                             else:
                                 raise Exception("Password hash not found in catalog, cannot execute query.")
                 except Exception as e:
@@ -2446,14 +2481,11 @@ Provide a helpful, direct answer.
                 )
             
             if conn_db:
-                # The query has passed the denylist check.
-                # A read-only database user is still the best practice.
                 df = pd.read_sql(sql_query, conn_db)
             else:
                 raise Exception(f"Unsupported database type '{db_type}'")
 
         except Exception as e:
-            # SQL execution error
             print(f"Bad SQL from Gemini: {sql_query}")
             print(f"Error: {e}")
             return jsonify({
@@ -2477,14 +2509,11 @@ Provide a helpful, direct answer.
             })
 
         try:
-            # Convert only non-numeric/non-string columns to string
             df_copy = df.copy()
             for col in df_copy.columns:
-                # Check if col is not numeric, string, or boolean
                 if not (pd.api.types.is_numeric_dtype(df_copy[col]) or 
                         pd.api.types.is_string_dtype(df_copy[col]) or 
                         pd.api.types.is_bool_dtype(df_copy[col])):
-                    # Convert other types (like datetime, timedelta) to string
                     df_copy[col] = df_copy[col].astype(str)
                     
             query_results_json = df_copy.to_json(orient="records")
@@ -2496,6 +2525,7 @@ Provide a helpful, direct answer.
              query_results_json = df.head(100).to_json(orient="records")
              print("Warning: Query result too large, truncating for AI analysis.")
 
+        # --- Step 4: Generate Analysis (UPDATED WITH CHART INSTRUCTIONS) ---
         prompt_step4 = f"""
 You are MetadataGenbot, an expert AI data analyst.
 A user asked: "{prompt}"
@@ -2509,7 +2539,13 @@ Your task is to provide a complete analysis. Return ONLY a JSON object with the 
 2.  "dashboard_summary": A 2-3 sentence summary. Use '{user_currency}' for money.
 3.  "key_metrics": An array of 2-4 key metrics (label, value).
     - Format monetary values explicitly with '{user_currency}' (e.g., "{user_currency}1,200.50").
-4.  "chart_specs": ... (keep existing instructions)
+4.  "chart_specs": An array of objects defining charts to visualize this data.
+    - "type": One of "bar", "line", "pie", "scatter".
+    - "title": A concise title for the chart.
+    - "keys": A dictionary mapping axes to column names from the data.
+        - For bar/line/scatter: {{ "x": "COLUMN_NAME", "y": "COLUMN_NAME" }}
+        - For pie: {{ "name": "COLUMN_NAME_FOR_LABELS", "value": "COLUMN_NAME_FOR_VALUES" }}
+    - IMPORTANT: The values in "keys" must EXACTLY match the column names in the provided data JSON (case-sensitive).
 
 Example Response:
 {{
@@ -2536,12 +2572,10 @@ Example Response:
 
             analysis_json = json.loads(analysis_response_str)
             
-            # --- ADDING SQL Query to chat_reply ---
             chat_reply = analysis_json.get("chat_reply", "I found data but couldn't generate a chat reply.")
             chat_reply += f"\n\n**Generated Query:**\n```sql\n{sql_query}\n```"
             
             table_data = None
-            
             if df.shape[0] < 1000: 
                 table_data = df.to_dict(orient="records")
             else:
@@ -2564,7 +2598,6 @@ Example Response:
         except json.JSONDecodeError as e:
             print(f"Failed to decode analysis JSON from Gemini: {e}")
             
-            # Fallback data preparation
             table_data = None
             table_columns = []
             
@@ -2572,7 +2605,7 @@ Example Response:
                 table_columns = [{"field": col, "headerName": col, "width": 150} for col in df.columns]
                 
                 if df.shape[0] < 200:
-                    table_data = df.head(200).to_dict(orient="records") # Use head(200) or similar logic
+                    table_data = df.head(200).to_dict(orient="records") 
                 else:
                      table_data = df.head(200).to_dict(orient="records")
 
@@ -2581,7 +2614,7 @@ Example Response:
                 "dashboard_data": None,
                 "raw_data": query_results_json,
                 "table_data": table_data,
-                "table_columns": table_columns # <--- NEW FIELD
+                "table_columns": table_columns 
             })
         except Exception as e:
             print(f"Error in final analysis step: {e}")
@@ -3072,4 +3105,3 @@ def get_report(filename):
 
 if __name__ == '__main__':
     app.run(debug=True)
-
