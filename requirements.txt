@@ -23,5 +23,5 @@ setuptools
 gunicorn
 cryptography
 openai
-base64
 contextlib
+
