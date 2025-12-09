@@ -7,7 +7,7 @@ import oracledb
 from flask_cors import CORS
 from sqlalchemy import create_engine
 from sqlalchemy.pool import QueuePool
-from contextlib import contextmanager  # <-- ADDED IMPORT
+from contextlib import contextmanager
 import pandas as pd
 import os
 import docx2txt
@@ -32,8 +32,7 @@ from ydata_profiling import ProfileReport
 import uuid
 from cryptography.fernet import Fernet
 from werkzeug.middleware.proxy_fix import ProxyFix
-import google.generativeai as genai
-from google.api_core import exceptions as google_exceptions
+from openai import AzureOpenAI
 
 encryption_key_str = os.environ.get('ENCRYPTION_KEY')
 if not encryption_key_str:
@@ -52,27 +51,26 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
 )
 
-app.secret_key = os.environ.get('SECRET_KEY','$2b$12$0Jk75xSGIWeEgIwuPp1tKu.DwVPwLF/bbv1p8ZIugc/iUlk4S7jFa')
+app.secret_key = os.environ.get('SECRET_KEY')
 if not app.secret_key:
-    if app.debug:
-        print("Warning: SECRET_KEY not set, using default. DO NOT use in production.")
-        app.secret_key = '$2b$12$0Jk75xSGIWeEgIwuPp1tKu.DwVPwLF/bbv1p8ZIugc/iUlk4S7jFa'
-    else:
-        raise ValueError("SECRET_KEY environment variable is not set. App cannot run.")
+    raise ValueError("SECRET_KEY environment variable is not set. App cannot run.")
 
 CORS(app, supports_credentials=True, origins=["http://localhost:3000", "https://Praveen-R-22.github.io", "https://analytix-hub-technologies-pvt-ltd.github.io"])
 
 REPORTS_DIR = "reports"
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
-# --- NEW: Configure Gemini SDK ---
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") 
-if not GEMINI_API_KEY:
-    print("Warning: GEMINI_API_KEY environment variable not set.")
-else:
-    genai.configure(api_key=GEMINI_API_KEY)
-
-DEFAULT_MODEL_NAME = "gemini-2.5-flash"
+# Initialize Azure OpenAI Client
+azure_client = None
+try:
+    azure_client = AzureOpenAI(
+        api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
+        api_version=os.environ.get("AZURE_OPENAI_API_VERSION"),
+        azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT")
+    )
+    AZURE_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME")
+except Exception as e:
+    print(f"Warning: Azure OpenAI not configured correctly: {e}")
 
 SNOWFLAKE_SCHEMA = os.getenv("SNOWFLAKE_SCHEMA", "ANALYTICSBOT")
 SNOWFLAKE_WAREHOUSE = os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH")
@@ -309,10 +307,6 @@ def _create_raw_snowflake_connection():
         print(f"FATAL: Could not create Snowflake connection for pool: {e}")
         raise
 
-# Create the Connection Pool
-# pool_size=10: Maintain 10 connections.
-# max_overflow=10: Allow 10 more if pool is full (total 20).
-# recycle=3600: Recycle connections every hour to prevent timeouts.
 SNOWFLAKE_POOL = QueuePool(
     _create_raw_snowflake_connection,
     max_overflow=10,
@@ -342,8 +336,6 @@ def get_db_conn_configured():
 
 def get_or_create_session_id(user_id):
     with get_db_conn_configured() as conn:
-        # Note: conn is a wrapper, so we access cursor via conn.cursor()
-        # snowflake.connector cursor supports context manager
         with conn.cursor() as cur:
             cur.execute(f"SELECT id FROM {SNOWFLAKE_SCHEMA}.chat_sessions WHERE user_id = %s", (user_id,))
             row = cur.fetchone()
@@ -357,77 +349,63 @@ def get_or_create_session_id(user_id):
             session_id = cur.fetchone()[0]
             return session_id
 
-def call_gemini_api(prompt_text, is_json_output=False):
-    if not GEMINI_API_KEY:
-        return "Error: GEMINI_API_KEY is not set on the server."
+def call_azure_api(prompt_text, is_json_output=False):
+    if not azure_client:
+        return "Error: Azure OpenAI client is not initialized."
 
     try:
-        generation_config = {}
-        
-        if is_json_output:
-            generation_config["response_mime_type"] = "application/json"
-
-        model = genai.GenerativeModel(DEFAULT_MODEL_NAME)
-        
-        # Make the request
-        response = model.generate_content(
-            prompt_text, 
-            generation_config=generation_config
-        )
-        
-        return response.text
-
-    except google_exceptions.DeadlineExceeded:
-        print("Error: Gemini API timed out.")
-        return "Error: The AI model took too long to respond. Please try with a smaller dataset."
-        
-    except google_exceptions.GoogleAPIError as e:
-        print(f"Error calling Gemini API: {e}")
-        return f"Error: Could not connect to Gemini API. {e}"
-        
-    except ValueError as e:
-        print(f"Error parsing Gemini response (blocked or empty): {e}")
-        return "Error: The AI model blocked the response or returned nothing."
-        
-    except Exception as e:
-        print(f"Unexpected Error in call_gemini_api: {e}")
-        return f"Error: An unexpected error occurred. {str(e)}"
-
-def call_gemini_vision_api(image_bytes, mime_type, prompt_text):
-    if not GEMINI_API_KEY:
-        return "Error: GEMINI_API_KEY is not set on the server."
-        
-    try:
-        model = genai.GenerativeModel(DEFAULT_MODEL_NAME)
-
-        content = [
-            prompt_text,
-            {
-                "mime_type": mime_type,
-                "data": image_bytes
-            }
+        messages = [
+            {"role": "user", "content": prompt_text}
         ]
+     
+        messages.insert(0, {"role": "system", "content": "You are a helpful AI data analyst."})
 
-        generation_config = {
-            "temperature": 0.2,
-            "top_k": 32,
-            "top_p": 1,
-            "max_output_tokens": 4096,
-        }
-
-        response = model.generate_content(
-            content,
-            generation_config=generation_config
-        )
+        if is_json_output:
+            messages[-1]["content"] += " Please respond in valid JSON format."
         
-        return response.text
+        response_format = { "type": "json_object" } if is_json_output else None
 
-    except google_exceptions.GoogleAPIError as e:
-        print(f"Error calling Gemini Vision API: {e}")
-        return f"Error: Could not connect to Gemini API. {e}"
+        response = azure_client.chat.completions.create(
+            model=AZURE_DEPLOYMENT,
+            messages=messages,
+            response_format=response_format 
+        )
+        return response.choices[0].message.content
+
     except Exception as e:
-        print(f"Unexpected Error in call_gemini_vision_api: {e}")
-        return f"Error: An unexpected error occurred. {str(e)}"
+        print(f"Error calling Azure OpenAI: {e}")
+        return f"Error: Could not connect to Azure API. {str(e)}"
+
+def call_azure_vision_api(image_bytes, mime_type, prompt_text):
+    if not azure_client:
+        return "Error: Azure OpenAI client is not initialized."
+
+    try:
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        data_url = f"data:{mime_type};base64,{base64_image}"
+
+        response = azure_client.chat.completions.create(
+            model=AZURE_DEPLOYMENT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt_text},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": data_url
+                            }
+                        }
+                    ]
+                }
+            ]
+        )
+        return response.choices[0].message.content
+
+    except Exception as e:
+        print(f"Error calling Azure Vision API: {e}")
+        return f"Error: {str(e)}"
 
 @app.route('/connect_database', methods=['POST'])
 def connect_database():
@@ -774,7 +752,7 @@ def extract_text_from_doc(uploaded_doc):
             image_bytes = uploaded_doc.read()
             mime_type = "application/pdf"
             analysis_prompt = "Analyze this PDF, which may be a scanned image of an ERD. Extract all tables, columns, and relationships."
-            doc_text = call_gemini_vision_api(image_bytes, mime_type, analysis_prompt)
+            doc_text = call_azure_vision_api(image_bytes, mime_type, analysis_prompt)
             
     elif ext == "html":
         soup = BeautifulSoup(uploaded_doc, features="html.parser")
@@ -803,7 +781,7 @@ def extract_text_from_doc(uploaded_doc):
             If the image is not an ERD, please describe what you see instead.
             """
             
-            doc_text = call_gemini_vision_api(image_bytes, mime_type, analysis_prompt)
+            doc_text = call_azure_vision_api(image_bytes, mime_type, analysis_prompt)
             
             if doc_text.startswith("Error:"):
                 print(f"Gemini Vision API failed: {doc_text}")
@@ -906,7 +884,7 @@ def generate_description():
     """
     
     start_time = time.time()
-    generated_json_str = call_gemini_api(prompt, is_json_output=True)
+    generated_json_str = call_azure_api(prompt, is_json_output=True)
     end_time = time.time()
     llm_response_time_ms = (end_time - start_time) * 1000
 
@@ -2239,7 +2217,7 @@ Example Response:
 }}
 """
         
-        response_str = call_gemini_api(prompt, is_json_output=False)
+        response_str = call_azure_api(prompt, is_json_output=False)
         
         # Clean the response
         json_match = re.search(r'```json\s*(\{.*?\})\s*```', response_str, re.DOTALL)
@@ -2296,7 +2274,7 @@ Example Response:
 }}
 """
         
-        response_str = call_gemini_api(prompt, is_json_output=False) # Use Gemini
+        response_str = call_azure_api(prompt, is_json_output=False) # Use Gemini
         
         # Clean the response
         json_match = re.search(r'```json\s*(\{.*?\})\s*```', response_str, re.DOTALL)
@@ -2329,13 +2307,18 @@ def intelligent_query():
     # --- Handle General (No DB) Questions ---
     if not connection_info:
         try:
-            system_prompt = (
-                "You are MetadataGenbot, an AI assistant specializing in data warehousing, "
-                "database management, and Snowflake. The user is not currently connected to a database, "
-                "so answer their questions generally."
-            )
-            full_prompt = f"{system_prompt}\n\nUser: {prompt}\nAssistant:"
-            ai_reply = call_gemini_api(full_prompt, is_json_output=False)
+            system_prompt = """You are MetadataGenbot, an expert AI assistant specializing in:
+- Data warehousing and database management
+- SQL optimization and query design
+- Snowflake, PostgreSQL, MySQL, Oracle, SQL Server
+- Data modeling and schema design
+- ETL/ELT processes
+
+Provide clear, actionable advice. Use examples when helpful."""
+
+            full_prompt = f"{system_prompt}\n\nUser Question: {prompt}\n\nProvide a helpful, detailed response:"
+            ai_reply = call_azure_api(full_prompt, is_json_output=False)
+            
             if ai_reply.startswith("Error:"):
                 return jsonify({"error": ai_reply}), 500
             
@@ -2363,66 +2346,94 @@ def intelligent_query():
         if schema_context.startswith("Error"):
              return jsonify({"error": schema_context}), 500
         
-        # --- Step 2: Generate SQL (UPDATED: NO SELECT *, LOWER() & INDIAN TERMS) ---
-        prompt_step2 = f"""
-You are an expert {db_type} data analyst. Your sole task is to convert the user's question into a single, runnable {db_type} SQL query.
-- You are connected to a database with this schema:
-{schema_context}
-- If the question can be answered with SQL, return ONLY the SQL query.
-- **IMPORTANT: ALWAYS add 'LIMIT 500' (or equivalent) to your query to prevent performance issues, unless the user explicitly asks for 'all' records.**
-- **Handle Indian Numbering System:** If the user mentions terms like 'Lakh', 'Lakhs', 'L', 'Crore', 'Crores', 'Cr', convert them to standard integers (1 Lakh = 100,000; 1 Crore = 10,000,000). 
-    - Example: "Revenue > 5 Cr" -> "Revenue > 50000000"
-    - Example: "Price under 2 Lakhs" -> "Price < 200000"
-- **String Matching Strategy (CRITICAL):** - **ALWAYS make text filters case-insensitive** using `LOWER()`.
-    - **Use Wildcards:** For categorical text (Category, State, Status), use `LIKE` with wildcards `%` to match partial strings.
-    - **Syntax:** `LOWER(column_name) LIKE '%value%'` (ensure the value inside quotes is lowercase).
-    - Example: User asks for "Roads" -> `LOWER(CATEGORY) LIKE '%roads%'`.
-    - Example: User asks for "Uttar Pradesh" -> `LOWER(STATENAME) LIKE '%uttar pradesh%'`.
-    - Example: User asks for "Railways, Roads" -> `(LOWER(CATEGORY) LIKE '%railways%' OR LOWER(CATEGORY) LIKE '%roads%')`.
-- **Column Selection (CRITICAL):** - **Do NOT use `SELECT *`.** Fetching all columns (especially wide text columns) slows down performance.
-    - **Select ONLY the specific columns** necessary to answer the user's question.
-    - If the user asks for "details", "all info", or implies a full row fetch, select the **top 10-15 most relevant columns** (e.g., IDs, Names, Dates, Monetary Values, Statuses) instead of `*`.
-- If the question is a greeting, a general question (e.g., "what is SQL?"), or cannot be answered with the provided schema, return ONLY the text "NO_SQL".
-- Do not add any explanation, markdown, or any text other than the query or "NO_SQL".
+        # --- Step 2: Generate SQL with improved prompt ---
+        prompt_step2 = f"""You are an expert {db_type} SQL developer. Convert the user's natural language question into a precise, executable SQL query.
 
-User Question: "{prompt}"
-"""
+**DATABASE SCHEMA:**
+{schema_context}
+
+**CRITICAL RULES:**
+
+1. **Column Selection:**
+   - SELECT only columns needed to answer the question
+   - NEVER use SELECT *
+   - Include descriptive column names when possible
+
+2. **Filtering Logic:**
+   - If user specifies a column (e.g., "in Category X"), filter ONLY that column
+   - Use LOWER(column_name) LIKE '%value%' for text matching
+   - For ambiguous terms, search across relevant columns with OR
+
+3. **Aggregations & Sorting:**
+   - Use appropriate aggregate functions (SUM, COUNT, AVG, MAX, MIN)
+   - Add ORDER BY for "top N" or "highest/lowest" queries
+   - Use GROUP BY when aggregating
+
+4. **Row Limits:**
+   - If user specifies a number (e.g., "top 10"), use exactly that: LIMIT 10
+   - If no number specified, add LIMIT 500 by default
+   - For {db_type}, use the correct syntax (LIMIT for most, TOP for SQL Server)
+
+5. **Indian Number Formats:**
+   - Convert "Lakh" or "L" to 100000
+   - Convert "Crore" or "Cr" to 10000000
+
+6. **Date Handling:**
+   - Use proper date functions for the database type
+   - Consider current date context when relevant
+
+**USER QUESTION:**
+"{prompt}"
+
+**RESPONSE FORMAT:**
+- If this cannot be answered with SQL or is a greeting, respond with exactly: NO_SQL
+- Otherwise, respond with ONLY the SQL query
+- No markdown, no backticks, no explanations
+- The query should be ready to execute
+
+**SQL QUERY:**"""
         
-        sql_query = call_gemini_api(prompt_step2).strip()
+        sql_query = call_azure_api(prompt_step2, is_json_output=False).strip()
         
         if sql_query.startswith("Error:"):
             return jsonify({"error": sql_query}), 500
         
-        # --- UPDATED CLEANUP LOGIC START ---
-        # 1. Extract from Markdown code blocks if present
+        # --- Enhanced SQL Cleanup ---
+        # Remove markdown code blocks
         code_block_match = re.search(r"```(?:sql|snowflake)?\s*(.*?)```", sql_query, re.DOTALL | re.IGNORECASE)
         if code_block_match:
             sql_query = code_block_match.group(1).strip()
 
-        # 2. Remove specific leading language labels if they appear without backticks (e.g. "snowflake\nSELECT")
+        # Remove language labels
+        sql_query = re.sub(r"^\s*(?:snowflake|sql|query):\s*", "", sql_query, flags=re.IGNORECASE).strip()
         sql_query = re.sub(r"^\s*(?:snowflake|sql)\s+", "", sql_query, flags=re.IGNORECASE).strip()
-        # --- UPDATED CLEANUP LOGIC END ---
+        
+        # Remove any remaining backticks
+        sql_query = sql_query.replace('`', '')
 
         # --- Handle NO_SQL (General Question) ---
         if sql_query.upper() == "NO_SQL":
-            prompt_step_general = f"""
-You are MetadataGenbot, an AI data assistant. The user is connected to a {db_type} database.
-The user asked: "{prompt}".
-You determined this is a general question, not a data query.
-Provide a helpful, direct answer.
-"""
-            final_reply = call_gemini_api(prompt_step_general)
+            prompt_step_general = f"""You are MetadataGenbot, an AI data assistant. 
+The user is connected to a {db_type} database with this schema:
+
+{schema_context[:500]}...
+
+User asked: "{prompt}"
+
+This appears to be a general question, not a data query. Provide a helpful, informative response."""
+            
+            final_reply = call_azure_api(prompt_step_general, is_json_output=False)
             return jsonify({
                 "reply": final_reply.strip(),
                 "dashboard_data": None,
                 "raw_data": None
             })
 
-        # --- Step 3: Run SQL Query ---
+        # --- Step 3: Security Check & Execute SQL ---
         df = None
         conn_db = None
         try:
-            # --- *** SECURITY FIX *** ---
+            # Security check
             destructive_keywords = [
                 'DROP', 'DELETE', 'INSERT', 'UPDATE', 
                 'TRUNCATE', 'ALTER', 'CREATE', 'GRANT', 'REVOKE'
@@ -2433,12 +2444,12 @@ Provide a helpful, direct answer.
                 if keyword in sql_upper_tokens:
                     print(f"Blocked potentially destructive query: {sql_query}")
                     return jsonify({
-                        "reply": f"Sorry, I cannot execute queries that might modify the database (e.g., {keyword}). I can only perform read operations (e.g., SELECT).",
+                        "reply": f"⚠️ Security Warning: I cannot execute queries containing {keyword} operations. I can only perform read operations (SELECT queries).",
                         "dashboard_data": None,
                         "raw_data": None
                     })
-            # --- *** END SECURITY FIX *** ---
 
+            # Execute query (existing connection logic)
             db_type = connection_info.get('db_type')
             host = connection_info.get('host')
             port = connection_info.get('port')
@@ -2446,7 +2457,7 @@ Provide a helpful, direct answer.
             password = connection_info.get('password')
             dbname = connection_info.get('dbname')
             
-            # --- Decrypt password if from catalog ---
+            # Decrypt password if from catalog
             if catalogid:
                 try:
                     with get_db_conn_configured() as conn:
@@ -2456,11 +2467,12 @@ Provide a helpful, direct answer.
                             if result and result[0]:
                                 password = cipher.decrypt(result[0].encode()).decode()
                             else:
-                                raise Exception("Password hash not found in catalog, cannot execute query.")
+                                raise Exception("Password hash not found in catalog")
                 except Exception as e:
-                    print(f"Could not decrypt password from catalog: {e}")
-                    return jsonify({"error": "Could not decrypt password from catalog to run query."}), 500
+                    print(f"Could not decrypt password: {e}")
+                    return jsonify({"error": "Authentication error with catalog"}), 500
 
+            # Connect to database
             if db_type == "MySQL":
                 conn_db = mysql.connector.connect(host=host, port=int(port), user=user, password=password, database=dbname)
             elif db_type == "PostgreSQL":
@@ -2486,13 +2498,19 @@ Provide a helpful, direct answer.
                 raise Exception(f"Unsupported database type '{db_type}'")
 
         except Exception as e:
-            print(f"Bad SQL from Gemini: {sql_query}")
-            print(f"Error: {e}")
+            print(f"SQL Execution Error: {e}")
+            print(f"Generated SQL: {sql_query}")
             return jsonify({
                 "reply": (
-                    f"Sorry, I encountered an error executing the query.\n\n"
-                    f"**Generated Query:**\n```sql\n{sql_query}\n```\n\n"
-                    f"**Error:**\n`{str(e)}`"
+                    f"❌ **Query Execution Error**\n\n"
+                    f"I generated this SQL query but it failed to execute:\n\n"
+                    f"```sql\n{sql_query}\n```\n\n"
+                    f"**Error Details:**\n`{str(e)}`\n\n"
+                    f"This might be due to:\n"
+                    f"- Invalid column or table names\n"
+                    f"- Syntax issues specific to {db_type}\n"
+                    f"- Data type mismatches\n\n"
+                    f"Please try rephrasing your question or provide more details."
                 ),
                 "dashboard_data": None,
                 "raw_data": None
@@ -2501,13 +2519,24 @@ Provide a helpful, direct answer.
             if conn_db and hasattr(conn_db, 'close'):
                 conn_db.close()
         
+        # --- Handle Empty Results ---
         if df is None or df.empty:
             return jsonify({
-                "reply": f"The query ran successfully but returned no data.\n\n**Generated Query:**\n```sql\n{sql_query}\n```",
+                "reply": (
+                    f"✅ **Query Executed Successfully**\n\n"
+                    f"The query completed without errors but returned no data.\n\n"
+                    f"**Generated Query:**\n```sql\n{sql_query}\n```\n\n"
+                    f"This could mean:\n"
+                    f"- No data matches your criteria\n"
+                    f"- The filters might be too restrictive\n"
+                    f"- The date range or conditions exclude all records\n\n"
+                    f"Try adjusting your question or broadening the search criteria."
+                ),
                 "dashboard_data": None,
                 "raw_data": "[]"
             })
 
+        # --- Step 4: Prepare data for analysis ---
         try:
             df_copy = df.copy()
             for col in df_copy.columns:
@@ -2519,62 +2548,101 @@ Provide a helpful, direct answer.
             query_results_json = df_copy.to_json(orient="records")
         except Exception as e:
             print(f"Error serializing DataFrame: {e}")
-            return jsonify({"error": "Failed to serialize query results for analysis."}), 500
+            return jsonify({"error": "Failed to serialize query results"}), 500
             
+        # Truncate if too large
         if len(query_results_json) > 100000:
              query_results_json = df.head(100).to_json(orient="records")
-             print("Warning: Query result too large, truncating for AI analysis.")
+             print("Warning: Large result set, truncated to 100 rows for analysis")
 
-        # --- Step 4: Generate Analysis (UPDATED WITH CHART INSTRUCTIONS) ---
-        prompt_step4 = f"""
-You are MetadataGenbot, an expert AI data analyst.
-A user asked: "{prompt}"
-You generated a SQL query which returned this data (as a JSON string):
+        prompt_step4 = f"""You are MetadataGenbot, an expert data analyst. Analyze the query results and provide comprehensive insights.
+
+USERS ORIGINAL QUESTION
+{prompt}
+
+QUERY RESULTS (JSON format) with {len(df)} rows
 {query_results_json}
 
-Your task is to provide a complete analysis. Return ONLY a JSON object with the following structure:
-1.  "chat_reply": A natural-language answer to the user's question.
-    - IMPORTANT: Use the currency symbol '{user_currency}' for any monetary values.
-    - Do not mention the JSON or charts.
-2.  "dashboard_summary": A 2-3 sentence summary. Use '{user_currency}' for money.
-3.  "key_metrics": An array of 2-4 key metrics (label, value).
-    - Format monetary values explicitly with '{user_currency}' (e.g., "{user_currency}1,200.50").
-4.  "chart_specs": An array of objects defining charts to visualize this data.
-    - "type": One of "bar", "line", "pie", "scatter".
-    - "title": A concise title for the chart.
-    - "keys": A dictionary mapping axes to column names from the data.
-        - For bar/line/scatter: {{ "x": "COLUMN_NAME", "y": "COLUMN_NAME" }}
-        - For pie: {{ "name": "COLUMN_NAME_FOR_LABELS", "value": "COLUMN_NAME_FOR_VALUES" }}
-    - IMPORTANT: The values in "keys" must EXACTLY match the column names in the provided data JSON (case-sensitive).
-
-Example Response:
+YOUR TASK
+Provide a complete analysis as a JSON object with this EXACT structure:
 {{
-  "chat_reply": "Based on the data, total sales were {user_currency}1,500,000...",
-  "dashboard_summary": "Strong performance showing {user_currency}1.5M in revenue...",
-  "key_metrics": [
-    {{"label": "Total Sales", "value": "{user_currency}1,500,000"}},
-    {{"label": "Average", "value": "{user_currency}120.50"}}
-  ],
-  "chart_specs": [
-    {{"type": "bar", "title": "Sales by Month", "keys": {{"x": "MONTH", "y": "TOTAL_SALES"}} }}
-  ]
+    "chatreply": "A natural, conversational answer to the users question. Use {user_currency} for monetary values. Be specific with numbers and insights. Start with the key finding, then provide supporting details. **Format this response professionally using Markdown** with proper headings (##, ###), bullet points, bold text for emphasis, and tables where appropriate.",
+    "dashboardsummary": "A concise 2-3 sentence executive summary of the findings.",
+    "keymetrics": [
+        {{"label": "Metric Name", "value": "Formatted Value with units"}},
+        {{"label": "Another Metric", "value": "Formatted Value"}}
+    ],
+    "chartspecs": [
+        {{
+            "type": "bar|line|pie|scatter|heatmap",
+            "title": "Descriptive Chart Title",
+            "keys": {{
+                "x": "EXACTCOLUMNNAMEFROMJSON",
+                "y": "EXACTCOLUMNNAMEFROMJSON"
+            }}
+        }}
+    ]
 }}
+
+CHART SPECIFICATIONS GUIDE
+- bar/line: {{"x": "categorycolumn", "y": "numericcolumn"}}
+- pie: {{"name": "categorycolumn", "value": "numericcolumn"}}
+- scatter: {{"x": "numericcolumn1", "y": "numericcolumn2"}}
+- heatmap: {{"x": "categorical1", "y": "categorical2", "value": "metric"}}
+
+CRITICAL RULES
+1. Column names in keys must EXACTLY match the JSON data column names (case-sensitive)
+2. Create 1-3 charts that best visualize the answer to the users question
+3. Use appropriate chart types for the data (dont force pie charts for time series)
+4. **Format numbers with proper suffixes:**
+   - For Indian numbering: Add "Cr" suffix for Crores (≥ 1,00,00,000), "L" for Lakhs (≥ 1,00,000)
+   - For International numbering: Add "B" suffix for Billions (≥ 1,000,000,000), "M" for Millions (≥ 1,000,000), "K" for Thousands (≥ 1,000)
+   - Apply these suffixes in both chatreply and keymetrics values
+   - Example: "15000000" should be "1.5 Cr" or "15 M" depending on context
+5. **Format the chatreply using professional Markdown:**
+   - Use ## for main sections and ### for subsections
+   - Use **bold** for key metrics and important findings
+   - Use bullet points (-) or numbered lists (1., 2., 3.) for clarity
+   - Use tables (| Header | Header |) when comparing multiple items
+   - Maintain proper spacing and readability
+6. Make the chatreply conversational and insightful, not just a data dump
+
+NUMBER FORMATTING EXAMPLES:
+- 1500000000 → "1.5 B" (Billion) or "150 Cr" (Crores)
+- 45000000 → "45 M" (Million) or "4.5 Cr" (Crores)
+- 2500000 → "2.5 M" (Million) or "25 L" (Lakhs)
+- 750000 → "750 K" (Thousand) or "7.5 L" (Lakhs)
+
+RESPOND WITH ONLY THE JSON OBJECT. NO MARKDOWN. NO EXTRA TEXT.
 """
+
         
         try:
-            analysis_response_str = call_gemini_api(prompt_step4)
+            analysis_response_str = call_azure_api(prompt_step4, is_json_output=True)
             
+            # Check for API errors
+            if not analysis_response_str or analysis_response_str.startswith("Error:"):
+                raise ValueError(f"Azure API error: {analysis_response_str}")
+
+            # Clean up response
             json_match = re.search(r'```json\s*(\{.*?\})\s*```', analysis_response_str, re.DOTALL)
+            
             if json_match:
                 analysis_response_str = json_match.group(1)
             else:
                 analysis_response_str = analysis_response_str.strip()
 
+            if not analysis_response_str:
+                raise ValueError("Empty response after cleanup")
+
+            # Parse JSON
             analysis_json = json.loads(analysis_response_str)
             
-            chat_reply = analysis_json.get("chat_reply", "I found data but couldn't generate a chat reply.")
-            chat_reply += f"\n\n**Generated Query:**\n```sql\n{sql_query}\n```"
+            # Build chat reply with SQL query
+            chat_reply = analysis_json.get("chatreply", "Analysis completed successfully.")
+            chat_reply += f"\n\n---\n**Generated SQL Query:**\n```sql\n{sql_query}\n```"
             
+            # Prepare table data for frontend
             table_data = None
             if df.shape[0] < 1000: 
                 table_data = df.to_dict(orient="records")
@@ -2586,43 +2654,50 @@ Example Response:
             return jsonify({
                 "reply": chat_reply,
                 "dashboard_data": {
-                    "summary": analysis_json.get("dashboard_summary"),
-                    "key_metrics": analysis_json.get("key_metrics"),
-                    "chart_specs": analysis_json.get("chart_specs")
+                    "summary": analysis_json.get("dashboardsummary", "Data retrieved successfully."),
+                    "key_metrics": analysis_json.get("keymetrics", []),
+                    "chart_specs": analysis_json.get("chartspecs", [])
                 },
                 "raw_data": query_results_json,
                 "table_data": table_data,
                 "table_columns": table_columns
             })
 
-        except json.JSONDecodeError as e:
-            print(f"Failed to decode analysis JSON from Gemini: {e}")
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"Analysis generation failed: {e}")
+            print(f"Raw response: {analysis_response_str if 'analysis_response_str' in locals() else 'N/A'}")
             
+            # Fallback response with table data
             table_data = None
             table_columns = []
             
             if df is not None and not df.empty:
                 table_columns = [{"field": col, "headerName": col, "width": 150} for col in df.columns]
-                
-                if df.shape[0] < 200:
-                    table_data = df.head(200).to_dict(orient="records") 
-                else:
-                     table_data = df.head(200).to_dict(orient="records")
+                table_data = df.head(200).to_dict(orient="records")
+
+            fallback_reply = (
+                f"✅ **Query Executed Successfully**\n\n"
+                f"I retrieved {len(df)} rows from the database. "
+                f"However, I'm having trouble generating a detailed analysis right now. "
+                f"Please review the data table below for the complete results.\n\n"
+                f"**Generated Query:**\n```sql\n{sql_query}\n```\n\n"
+                f"**Row Count:** {len(df)}\n"
+                f"**Columns:** {', '.join(df.columns.tolist())}"
+            )
 
             return jsonify({
-                "reply": "I found the following data:\n\n" + df.head(10).to_string() + f"\n\n**Generated Query:**\n```sql\n{sql_query}\n```",
+                "reply": fallback_reply,
                 "dashboard_data": None,
                 "raw_data": query_results_json,
                 "table_data": table_data,
                 "table_columns": table_columns 
             })
-        except Exception as e:
-            print(f"Error in final analysis step: {e}")
-            return jsonify({"error": str(e)}), 500
-
+            
     except Exception as e:
-        print(f"Error in /api/chat/intelligent_query: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f"Critical error in intelligent_query: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 
 @app.route('/generate_excel', methods=['POST'])
@@ -3104,4 +3179,4 @@ def get_report(filename):
 
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run()
