@@ -7,7 +7,7 @@ import oracledb
 from flask_cors import CORS
 from sqlalchemy import create_engine
 from sqlalchemy.pool import QueuePool
-from contextlib import contextmanager
+from contextlib import contextmanager  # <-- ADDED IMPORT
 import pandas as pd
 import os
 import docx2txt
@@ -51,9 +51,13 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
 )
 
-app.secret_key = os.environ.get('SECRET_KEY')
+app.secret_key = os.environ.get('SECRET_KEY','$2b$12$0Jk75xSGIWeEgIwuPp1tKu.DwVPwLF/bbv1p8ZIugc/iUlk4S7jFa')
 if not app.secret_key:
-    raise ValueError("SECRET_KEY environment variable is not set. App cannot run.")
+    if app.debug:
+        print("Warning: SECRET_KEY not set, using default. DO NOT use in production.")
+        app.secret_key = '$2b$12$0Jk75xSGIWeEgIwuPp1tKu.DwVPwLF/bbv1p8ZIugc/iUlk4S7jFa'
+    else:
+        raise ValueError("SECRET_KEY environment variable is not set. App cannot run.")
 
 CORS(app, supports_credentials=True, origins=["http://localhost:3000", "https://Praveen-R-22.github.io", "https://analytix-hub-technologies-pvt-ltd.github.io"])
 
@@ -1251,7 +1255,7 @@ def get_chat_history():
                         FROM {SNOWFLAKE_SCHEMA}.messages 
                         WHERE session_id = %s 
                         ORDER BY created_at DESC 
-                        LIMIT 5
+                        LIMIT 6
                     ) ORDER BY created_at ASC
                     """,
                     (session_id,),
@@ -2347,6 +2351,7 @@ Provide clear, actionable advice. Use examples when helpful."""
              return jsonify({"error": schema_context}), 500
         
         # --- Step 2: Generate SQL with improved prompt ---
+        # --- Step 2: Generate SQL with improved prompt ---
         prompt_step2 = f"""You are an expert {db_type} SQL developer. Convert the user's natural language question into a precise, executable SQL query.
 
 **DATABASE SCHEMA:**
@@ -2355,32 +2360,37 @@ Provide clear, actionable advice. Use examples when helpful."""
 **CRITICAL RULES:**
 
 1. **Column Selection:**
-   - SELECT only columns needed to answer the question
-   - NEVER use SELECT *
-   - Include descriptive column names when possible
+   - SELECT only columns needed to answer the question.
+   - NEVER use SELECT *.
+   - Include descriptive column names when possible.
 
-2. **Filtering Logic:**
-   - If user specifies a column (e.g., "in Category X"), filter ONLY that column
-   - Use LOWER(column_name) LIKE '%value%' for text matching
-   - For ambiguous terms, search across relevant columns with OR
+2. **Table Relationships (Business Logic):**
+   - **Tenders vs. Awarded:** The database has a `tender` table (all opportunities) and an `awarded` table (results).
+   - **Finding Winners:** To find successful/awarded tenders, you MUST JOIN `tender` with `awarded` and filter by `awarded.is_winner = 1` (or TRUE).
+   - *Example:* "List awarded tenders" → `SELECT t.* FROM tender t JOIN awarded a ON t.id = a.tender_id WHERE a.is_winner = 1`.
 
-3. **Aggregations & Sorting:**
-   - Use appropriate aggregate functions (SUM, COUNT, AVG, MAX, MIN)
-   - Add ORDER BY for "top N" or "highest/lowest" queries
-   - Use GROUP BY when aggregating
+3. **Handling Subjective/Qualitative Terms ("Good", "Best", "Top"):**
+   - **DO NOT** search for the string "good" using `LIKE '%good%'` unless explicitly asked.
+   - **Interpret "Good" using Business Logic:**
+     - **Option A (High Value):** Sort by `TENDERVALUE` DESC.
+     - **Option B (Success):** Filter for awarded tenders (`is_winner = 1`).
+     - **Default Behavior:** If the user asks for "good tenders" without context, prioritize **High Value** (`ORDER BY TENDERVALUE DESC`).
 
-4. **Row Limits:**
-   - If user specifies a number (e.g., "top 10"), use exactly that: LIMIT 10
-   - If no number specified, add LIMIT 500 by default
-   - For {db_type}, use the correct syntax (LIMIT for most, TOP for SQL Server)
+4. **Filtering Logic:**
+   - Use LOWER(column_name) LIKE '%value%' for text matching ONLY for specific names/titles.
+   - For ambiguous terms, search across relevant columns with OR.
 
-5. **Indian Number Formats:**
-   - Convert "Lakh" or "L" to 100000
-   - Convert "Crore" or "Cr" to 10000000
+5. **Aggregations & Sorting:**
+   - Use appropriate aggregate functions (SUM, COUNT, AVG).
+   - Always ADD `ORDER BY` for "top/best" queries.
+   - Use `GROUP BY` when aggregating.
 
-6. **Date Handling:**
-   - Use proper date functions for the database type
-   - Consider current date context when relevant
+6. **Row Limits:**
+   - If user specifies a number (e.g., "top 10"), use `LIMIT 10` (or `TOP 10`).
+   - Default to `LIMIT 500` if no number is specified.
+
+7. **Regional Formats:**
+   - Convert "Lakh" to 100,000 and "Crore" to 10,000,000.
 
 **USER QUESTION:**
 "{prompt}"
@@ -2388,8 +2398,7 @@ Provide clear, actionable advice. Use examples when helpful."""
 **RESPONSE FORMAT:**
 - If this cannot be answered with SQL or is a greeting, respond with exactly: NO_SQL
 - Otherwise, respond with ONLY the SQL query
-- No markdown, no backticks, no explanations
-- The query should be ready to execute
+- No markdown, no backticks, no explanations.
 
 **SQL QUERY:**"""
         
