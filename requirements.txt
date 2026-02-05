@@ -23,5 +23,3 @@ setuptools
 gunicorn
 cryptography
 openai
-
-
