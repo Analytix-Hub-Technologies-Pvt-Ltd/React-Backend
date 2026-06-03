@@ -7,7 +7,7 @@ import oracledb
 from flask_cors import CORS
 from sqlalchemy import create_engine
 from sqlalchemy.pool import QueuePool
-from contextlib import contextmanager  # <-- ADDED IMPORT
+from contextlib import contextmanager
 import pandas as pd
 import os
 import docx2txt
