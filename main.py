@@ -64,7 +64,7 @@ CORS(app, supports_credentials=True, origins=["http://localhost:3000", "https://
 REPORTS_DIR = "reports"
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
-# Initialize Azure OpenAI Client
+# Initialize Azure OpenAI Client 
 azure_client = None
 try:
     azure_client = AzureOpenAI(
