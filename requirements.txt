@@ -19,7 +19,7 @@ bcrypt
 reportlab
 pyarrow
 python-dotenv
-setuptools
+setuptools==81.0.0
 gunicorn
 cryptography
 openai
